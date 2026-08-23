@@ -524,20 +524,90 @@ def patch_binary(data, enable_printf_logs=False):
 
 
 def patch_ipa(in_path, out_path, enable_printf_logs=False):
-    # Replace only app binary inside IPA; preserve all other entries.
+    # Locate the actual app executable dynamically from Info.plist instead of
+    # assuming the binary is always named YouTubeUnstable.
+
+    import plistlib
+
     with zipfile.ZipFile(in_path, "r") as zin:
         infos = zin.infolist()
-        bin_info = next((i for i in infos if i.filename.endswith("/YouTubeUnstable")), None)
+
+        # Find Payload/*.app/Info.plist
+        plist_info = next(
+            (
+                i for i in infos
+                if i.filename.startswith("Payload/")
+                and i.filename.count("/") == 2
+                and i.filename.endswith(".app/Info.plist")
+            ),
+            None,
+        )
+
+        if not plist_info:
+            raise ValueError("Unable to locate Payload/*.app/Info.plist in IPA")
+
+        plist_data = zin.read(plist_info.filename)
+
+        try:
+            plist = plistlib.loads(plist_data)
+        except Exception as exc:
+            raise ValueError(f"Unable to parse Info.plist: {exc}") from exc
+
+        executable_name = plist.get("CFBundleExecutable")
+
+        if not executable_name:
+            raise ValueError("CFBundleExecutable not found in Info.plist")
+
+        app_dir = plist_info.filename.rsplit("/", 1)[0]
+        executable_path = f"{app_dir}/{executable_name}"
+
+        print("Detected app bundle:", app_dir)
+        print("Detected executable:", executable_name)
+        print("Executable path:", executable_path)
+
+        bin_info = next(
+            (i for i in infos if i.filename == executable_path),
+            None,
+        )
+
         if not bin_info:
-            raise ValueError("YouTubeUnstable binary not found in IPA")
+            # Diagnostic output to make future YouTube layout changes obvious.
+            print("")
+            print("Files at app root:")
+            prefix = app_dir + "/"
+
+            for item in infos:
+                if (
+                    item.filename.startswith(prefix)
+                    and item.filename != prefix
+                    and "/" not in item.filename[len(prefix):].rstrip("/")
+                ):
+                    print(" ", item.filename)
+
+            raise ValueError(
+                f"Executable declared by Info.plist was not found: "
+                f"{executable_path}"
+            )
 
         binary = bytearray(zin.read(bin_info.filename))
-        meta = patch_binary(binary, enable_printf_logs=enable_printf_logs)
+
+        print("Executable size:", len(binary), "bytes")
+        print("Starting μTube binary patching...")
+
+        meta = patch_binary(
+            binary,
+            enable_printf_logs=enable_printf_logs,
+        )
 
         with zipfile.ZipFile(out_path, "w") as zout:
             for info in infos:
-                payload = binary if info.filename == bin_info.filename else zin.read(info.filename)
+                if info.filename == bin_info.filename:
+                    payload = binary
+                else:
+                    payload = zin.read(info.filename)
+
                 zout.writestr(info, payload)
+
     return meta
 
 

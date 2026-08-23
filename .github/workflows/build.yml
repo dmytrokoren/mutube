@@ -38,6 +38,8 @@ jobs:
         run: |
           mkdir -p ipa
 
+          echo "Downloading decrypted YouTube tvOS IPA..."
+
           curl \
             --location \
             --fail \
@@ -55,17 +57,26 @@ jobs:
           echo "Downloaded IPA:"
           ls -lh ipa/input.ipa
 
-      - name: Detect YouTube version
+          if ! unzip -t ipa/input.ipa >/dev/null 2>&1; then
+            echo "ERROR: Download is not a valid IPA/ZIP file."
+            exit 1
+          fi
+
+      - name: Detect YouTube information
         run: |
           rm -rf /tmp/youtube
           mkdir -p /tmp/youtube
 
           unzip -q ipa/input.ipa -d /tmp/youtube
 
-          APP_PATH=$(find /tmp/youtube/Payload -maxdepth 1 -type d -name "*.app" | head -1)
+          APP_PATH=$(find /tmp/youtube/Payload \
+            -maxdepth 1 \
+            -type d \
+            -name "*.app" \
+            | head -1)
 
           if [ -z "$APP_PATH" ]; then
-            echo "ERROR: No .app bundle found."
+            echo "ERROR: No .app bundle found in IPA."
             exit 1
           fi
 
@@ -88,21 +99,41 @@ jobs:
             "$INFO_PLIST"
           )
 
-          BUNDLE_ID=$(
+          YOUTUBE_BUNDLE_ID=$(
             /usr/libexec/PlistBuddy \
             -c "Print :CFBundleIdentifier" \
             "$INFO_PLIST"
           )
 
-          echo "Detected YouTube version: $YOUTUBE_VERSION"
-          echo "Build: $YOUTUBE_BUILD"
-          echo "Bundle ID: $BUNDLE_ID"
+          YOUTUBE_EXECUTABLE=$(
+            /usr/libexec/PlistBuddy \
+            -c "Print :CFBundleExecutable" \
+            "$INFO_PLIST"
+          )
+
+          echo "======================================"
+          echo "YouTube IPA Information"
+          echo "======================================"
+          echo "Version:     $YOUTUBE_VERSION"
+          echo "Build:       $YOUTUBE_BUILD"
+          echo "Bundle ID:   $YOUTUBE_BUNDLE_ID"
+          echo "Executable:  $YOUTUBE_EXECUTABLE"
+          echo "======================================"
+
+          if [ ! -f "$APP_PATH/$YOUTUBE_EXECUTABLE" ]; then
+            echo "ERROR: Declared executable does not exist:"
+            echo "$APP_PATH/$YOUTUBE_EXECUTABLE"
+            exit 1
+          fi
+
+          ls -lh "$APP_PATH/$YOUTUBE_EXECUTABLE"
 
           echo "YOUTUBE_VERSION=$YOUTUBE_VERSION" >> "$GITHUB_ENV"
           echo "YOUTUBE_BUILD=$YOUTUBE_BUILD" >> "$GITHUB_ENV"
-          echo "YOUTUBE_BUNDLE_ID=$BUNDLE_ID" >> "$GITHUB_ENV"
+          echo "YOUTUBE_BUNDLE_ID=$YOUTUBE_BUNDLE_ID" >> "$GITHUB_ENV"
+          echo "YOUTUBE_EXECUTABLE=$YOUTUBE_EXECUTABLE" >> "$GITHUB_ENV"
 
-      - name: Prepare IPA for μTube
+      - name: Prepare μTube input
         run: |
           cp ipa/input.ipa ipa/YouTube_4.54.01_decrypted.ipa
 
@@ -110,26 +141,36 @@ jobs:
         env:
           DEBUG_LOGS: ${{ inputs.enable_debug_logs }}
         run: |
+          echo "Building μTube for YouTube ${YOUTUBE_VERSION}"
+          echo "Executable: ${YOUTUBE_EXECUTABLE}"
+
           if [ "$DEBUG_LOGS" = "true" ]; then
             make PRINTF_LOGS=1
           else
             make
           fi
 
-      - name: Verify output
+      - name: Verify patched IPA
         run: |
           if [ ! -f mutube.ipa ]; then
             echo "ERROR: mutube.ipa was not created."
             exit 1
           fi
 
-          unzip -t mutube.ipa >/dev/null
+          if ! unzip -t mutube.ipa >/dev/null; then
+            echo "ERROR: Generated μTube IPA is invalid."
+            exit 1
+          fi
+
+          echo "μTube IPA successfully generated:"
+          ls -lh mutube.ipa
 
       - name: Rename output IPA
         env:
           OUTPUT_NAME: ${{ inputs.output_name }}
         run: |
-          SAFE_NAME=$(echo "$OUTPUT_NAME" | sed 's/[^A-Za-z0-9._-]/_/g')
+          SAFE_NAME=$(echo "$OUTPUT_NAME" \
+            | sed 's/[^A-Za-z0-9._-]/_/g')
 
           FINAL_NAME="${SAFE_NAME}-YouTube-${YOUTUBE_VERSION}.ipa"
 
@@ -140,12 +181,15 @@ jobs:
 
       - name: Build summary
         run: |
-          echo "## μTube Build" >> "$GITHUB_STEP_SUMMARY"
+          echo "# μTube Build" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- YouTube version: **${YOUTUBE_VERSION}**" >> "$GITHUB_STEP_SUMMARY"
-          echo "- YouTube build: **${YOUTUBE_BUILD}**" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Bundle ID: \`${YOUTUBE_BUNDLE_ID}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Output: \`${IPA_FILE}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Item | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| YouTube version | **${YOUTUBE_VERSION}** |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| YouTube build | ${YOUTUBE_BUILD} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Bundle ID | \`${YOUTUBE_BUNDLE_ID}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Executable | \`${YOUTUBE_EXECUTABLE}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Output | \`${IPA_FILE}\` |" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4

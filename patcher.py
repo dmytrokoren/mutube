@@ -579,7 +579,7 @@ def patch_binary(data, enable_printf_logs=False):
 
     f2v = lambda off: info["text_seg_va"] + (off - info["text_seg_off"])
     addrs = {k: f2v(v) for k, v in offs.items()}
-       required_stubs = {
+    required_stubs = {
         "find": (
             "__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4findEPKcmm"
         ),

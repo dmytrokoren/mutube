@@ -1,0 +1,123 @@
+name: Build μTube
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: "URL to the decrypted YouTube tvOS IPA file"
+        required: true
+        type: string
+
+      enable_debug_logs:
+        description: "Enable μTube debug/printf logs"
+        required: true
+        default: false
+        type: boolean
+
+      output_name:
+        description: "Output IPA name"
+        required: true
+        default: "muTube"
+        type: string
+
+jobs:
+  build:
+    name: Build μTube IPA
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Download decrypted YouTube IPA
+        env:
+          IPA_URL: ${{ inputs.ipa_url }}
+        run: |
+          mkdir -p ipa
+
+          curl \
+            --location \
+            --fail \
+            --show-error \
+            --retry 3 \
+            --retry-delay 3 \
+            "$IPA_URL" \
+            --output ipa/input.ipa
+
+          if [ ! -s ipa/input.ipa ]; then
+            echo "ERROR: Downloaded IPA is empty."
+            exit 1
+          fi
+
+          if ! unzip -t ipa/input.ipa >/dev/null 2>&1; then
+            echo "ERROR: Download is not a valid IPA/ZIP file."
+            exit 1
+          fi
+
+          ls -lh ipa/input.ipa
+
+      - name: Detect YouTube information
+        run: |
+          rm -rf /tmp/youtube
+          mkdir -p /tmp/youtube
+          unzip -q ipa/input.ipa -d /tmp/youtube
+
+          APP_PATH=$(find /tmp/youtube/Payload -maxdepth 1 -type d -name "*.app" | head -1)
+          INFO_PLIST="$APP_PATH/Info.plist"
+
+          YOUTUBE_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$INFO_PLIST")
+          YOUTUBE_BUILD=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$INFO_PLIST")
+          YOUTUBE_BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$INFO_PLIST")
+          YOUTUBE_EXECUTABLE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$INFO_PLIST")
+
+          echo "Version: $YOUTUBE_VERSION"
+          echo "Build: $YOUTUBE_BUILD"
+          echo "Bundle ID: $YOUTUBE_BUNDLE_ID"
+          echo "Executable: $YOUTUBE_EXECUTABLE"
+
+          echo "YOUTUBE_VERSION=$YOUTUBE_VERSION" >> "$GITHUB_ENV"
+          echo "YOUTUBE_BUILD=$YOUTUBE_BUILD" >> "$GITHUB_ENV"
+          echo "YOUTUBE_BUNDLE_ID=$YOUTUBE_BUNDLE_ID" >> "$GITHUB_ENV"
+          echo "YOUTUBE_EXECUTABLE=$YOUTUBE_EXECUTABLE" >> "$GITHUB_ENV"
+
+      - name: Generate compatibility analysis
+        run: |
+          uv run analyze_ipa.py \
+            --ipa ipa/input.ipa \
+            --out mutube-analysis-${YOUTUBE_VERSION}.txt
+
+          echo "ANALYSIS_FILE=mutube-analysis-${YOUTUBE_VERSION}.txt" >> "$GITHUB_ENV"
+
+      - name: Upload analysis report
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutube-analysis-${{ env.YOUTUBE_VERSION }}
+          path: ${{ env.ANALYSIS_FILE }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Prepare μTube input
+        run: |
+          cp ipa/input.ipa ipa/YouTube_4.54.01_decrypted.ipa
+
+      - name: Build μTube
+        continue-on-error: true
+        env:
+          DEBUG_LOGS: ${{ inputs.enable_debug_logs }}
+        run: |
+          if [ "$DEBUG_LOGS" = "true" ]; then
+            make PRINTF_LOGS=1
+          else
+            make
+          fi
+
+      - name: Upload IPA if build succeeded
+        if: ${{ hashFiles('mutube.ipa') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: muTube-YouTube-${{ env.YOUTUBE_VERSION }}
+          path: mutube.ipa
+          retention-days: 7

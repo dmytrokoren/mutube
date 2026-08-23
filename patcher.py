@@ -245,19 +245,147 @@ def resolve_patch_site(data, info, entry_va, max_scan=24):
     raise ValueError(f"failed to find first non-prologue instruction after {hex(entry_va)}")
 
 
-def resolve_stub_va(info, symbol_name):
-    # Resolve imported symbol trampoline VA from __stubs + indirect symbols.
+def get_stub_symbols(info):
+    """Return all imported symbols that have an entry in __stubs."""
     stubs = info["stubs"]
     dysym = info["dysym"]
+
     stub_size = stubs.reserved2
     if stub_size == 0:
         raise ValueError("__stubs has zero stub size")
 
-    for i in range(stubs.size // stub_size):
-        sym = dysym.indirect_symbols[stubs.reserved1 + i]
-        if getattr(sym, "name", None) == symbol_name:
-            return stubs.virtual_address + i * stub_size
+    results = []
+
+    count = stubs.size // stub_size
+
+    for i in range(count):
+        try:
+            sym = dysym.indirect_symbols[stubs.reserved1 + i]
+        except (IndexError, TypeError):
+            continue
+
+        name = getattr(sym, "name", None)
+
+        if not name:
+            continue
+
+        results.append(
+            {
+                "name": name,
+                "va": stubs.virtual_address + i * stub_size,
+                "index": i,
+            }
+        )
+
+    return results
+
+
+def resolve_stub_va(info, symbol_name):
+    """Resolve imported symbol trampoline VA from __stubs."""
+    for entry in get_stub_symbols(info):
+        if entry["name"] == symbol_name:
+            return entry["va"]
+
     raise ValueError(f"stub not found for symbol {symbol_name}")
+
+
+def diagnose_stub_symbols(info):
+    print("")
+    print("=" * 72)
+    print("μTube Mach-O import/stub diagnostic")
+    print("=" * 72)
+
+    symbols = get_stub_symbols(info)
+
+    print(f"Total imported stubs: {len(symbols)}")
+    print("")
+
+    wanted = {
+        "std::string::find": (
+            "__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4findEPKcmm"
+        ),
+        "std::string::insert": (
+            "__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEmPKcm"
+        ),
+        "strstr": "_strstr",
+        "memmem": "_memmem",
+        "memcmp": "_memcmp",
+        "strlen": "_strlen",
+        "strnstr": "_strnstr",
+        "objc_getClass": "_objc_getClass",
+        "objc_msgSend": "_objc_msgSend",
+        "dlsym": "_dlsym",
+        "printf": "_printf",
+    }
+
+    available = {entry["name"]: entry for entry in symbols}
+
+    print("Required / interesting symbols:")
+    print("-" * 72)
+
+    for label, name in wanted.items():
+        entry = available.get(name)
+
+        if entry:
+            print(f"FOUND   {label:22} {name}")
+            print(f"        VA: {hex(entry['va'])}")
+        else:
+            print(f"MISSING {label:22} {name}")
+
+    print("")
+    print("Possible string/search related imports:")
+    print("-" * 72)
+
+    keywords = (
+        "find",
+        "insert",
+        "strstr",
+        "strnstr",
+        "memmem",
+        "memcmp",
+        "strlen",
+        "string",
+        "char_traits",
+    )
+
+    matches = []
+
+    for entry in symbols:
+        lower = entry["name"].lower()
+
+        if any(keyword in lower for keyword in keywords):
+            matches.append(entry)
+
+    if matches:
+        for entry in matches:
+            print(f"{hex(entry['va']):18} {entry['name']}")
+    else:
+        print("No matching string/search imports found.")
+
+    print("")
+    print("libc++ (__ZNSt3 / __ZNKSt3) imports:")
+    print("-" * 72)
+
+    cpp_matches = [
+        entry
+        for entry in symbols
+        if "__ZNSt3" in entry["name"] or "__ZNKSt3" in entry["name"]
+    ]
+
+    if cpp_matches:
+        for entry in cpp_matches[:200]:
+            print(f"{hex(entry['va']):18} {entry['name']}")
+
+        if len(cpp_matches) > 200:
+            print(f"... {len(cpp_matches) - 200} additional libc++ imports omitted")
+    else:
+        print("No libc++ stubs found.")
+
+    print("")
+    print("=" * 72)
+    print("End μTube Mach-O diagnostic")
+    print("=" * 72)
+    print("")
 
 
 class Allocator:
@@ -412,9 +540,11 @@ def build_stub(kind, stub_va, addrs, orig_ins, enable_printf_logs):
     lines += [*restore_regs(), f".word 0x{orig_ins:08x}", "ret"]
     return asm_lines(lines)
 
-
 def patch_binary(data, enable_printf_logs=False):
     info = parse_macho_info(data)
+
+    # Diagnostic for newer YouTube/Cobalt binaries.
+    diagnose_stub_symbols(info)
     start, end = info["header_end"], info["text_off"]
     if start >= end:
         raise ValueError("no __TEXT padding available for stubs")
@@ -449,19 +579,72 @@ def patch_binary(data, enable_printf_logs=False):
 
     f2v = lambda off: info["text_seg_va"] + (off - info["text_seg_off"])
     addrs = {k: f2v(v) for k, v in offs.items()}
+       required_stubs = {
+        "find": (
+            "__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4findEPKcmm"
+        ),
+        "insert": (
+            "__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEmPKcm"
+        ),
+        "strstr": "_strstr",
+        "objc_get_class": "_objc_getClass",
+        "objc_msg_send": "_objc_msgSend",
+        "dlsym": "_dlsym",
+    }
+
+    if enable_printf_logs:
+        required_stubs["printf"] = "_printf"
+
+    resolved_stubs = {}
+    missing_stubs = []
+
+    print("")
+    print("Resolving μTube required imports...")
+    print("-" * 72)
+
+    for key, symbol in required_stubs.items():
+        try:
+            va = resolve_stub_va(info, symbol)
+            resolved_stubs[key] = va
+            print(f"FOUND   {key:16} {hex(va)}")
+            print(f"        {symbol}")
+        except ValueError:
+            missing_stubs.append((key, symbol))
+            print(f"MISSING {key:16}")
+            print(f"        {symbol}")
+
     addrs |= {
         "yttv_len": len(YTTV_NEEDLE),
         "inject_len": len(js),
         "csp_len": len(CSP_PREFIX),
-        "find": resolve_stub_va(info, "__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4findEPKcmm"),
-        "insert": resolve_stub_va(info, "__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEmPKcm"),
-        "strstr": resolve_stub_va(info, "_strstr"),
-        "objc_get_class": resolve_stub_va(info, "_objc_getClass"),
-        "objc_msg_send": resolve_stub_va(info, "_objc_msgSend"),
-        "dlsym": resolve_stub_va(info, "_dlsym"),
     }
-    if enable_printf_logs:
-        addrs["printf"] = resolve_stub_va(info, "_printf")
+
+    addrs |= resolved_stubs
+
+    if missing_stubs:
+        print("")
+        print("=" * 72)
+        print("YouTube/Cobalt compatibility problem")
+        print("=" * 72)
+
+        for key, symbol in missing_stubs:
+            print(f"MISSING: {key}")
+            print(f"         {symbol}")
+
+        print("")
+        print(
+            "μTube's 4.54.01 injection implementation cannot be used "
+            "unchanged with this YouTube binary."
+        )
+        print(
+            "Use the import diagnostic above to determine replacement "
+            "functions for this version."
+        )
+
+        raise ValueError(
+            "required μTube imports missing: "
+            + ", ".join(key for key, _ in missing_stubs)
+        )
 
     # Resolve final patch sites dynamically from function entry + prologue scan.
     resolved = []

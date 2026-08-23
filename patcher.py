@@ -388,6 +388,202 @@ def diagnose_stub_symbols(info):
     print("")
 
 
+def dump_disasm_context(data, info, center_va, before=10, after=14, title=None):
+    """Print a small ARM64 disassembly window around a virtual address."""
+    start_va = max(info["text_va"], center_va - before * 4)
+    end_va = min(info["text_va"] + info["text_size"], center_va + (after + 1) * 4)
+    start_off = info["text_off"] + (start_va - info["text_va"])
+    end_off = info["text_off"] + (end_va - info["text_va"])
+
+    if title:
+        print(title)
+    print(f"Disassembly around {hex(center_va)}:")
+    for ins in MD.disasm(bytes(data[start_off:end_off]), start_va):
+        marker = ">>" if ins.address == center_va else "  "
+        print(f"{marker} {ins.address:#018x}  {ins.mnemonic:8} {ins.op_str}")
+    print("")
+
+
+def scan_bl_xrefs(data, info, targets, max_hits_per_target=24):
+    """Find direct ARM64 BL references to selected target VAs in __text."""
+    wanted = {va: name for name, va in targets.items() if va is not None}
+    hits = {name: [] for name in targets}
+    if not wanted:
+        return hits
+
+    text_off = info["text_off"]
+    text_size = info["text_size"] & ~3
+    text_va = info["text_va"]
+    view = memoryview(data)[text_off:text_off + text_size]
+
+    for idx, (word,) in enumerate(struct.iter_unpack("<I", view)):
+        # ARM64 BL immediate: op[31:26] == 100101b.
+        if (word & 0xFC000000) != 0x94000000:
+            continue
+        imm26 = word & 0x03FFFFFF
+        if imm26 & 0x02000000:
+            imm26 -= 1 << 26
+        src_va = text_va + idx * 4
+        dst_va = src_va + (imm26 << 2)
+        name = wanted.get(dst_va)
+        if name is None:
+            continue
+        if len(hits[name]) < max_hits_per_target:
+            hits[name].append(src_va)
+
+    return hits
+
+
+def find_raw_ascii_occurrences(data, needles, max_hits=20):
+    """Locate useful ASCII strings in the Mach-O for reverse-engineering diagnostics."""
+    results = {}
+    blob = bytes(data)
+    for needle in needles:
+        raw = needle.encode("ascii")
+        positions = []
+        start = 0
+        while len(positions) < max_hits:
+            pos = blob.find(raw, start)
+            if pos < 0:
+                break
+            positions.append(pos)
+            start = pos + 1
+        results[needle] = positions
+    return results
+
+
+def diagnose_modern_cobalt(data, info):
+    """Collect evidence needed to create a patch profile for newer YouTube/Cobalt builds."""
+    print("")
+    print("=" * 72)
+    print("μTube modern Cobalt candidate scan")
+    print("=" * 72)
+    print(f"__text VA:   {hex(info['text_va'])}")
+    print(f"__text size: {hex(info['text_size'])} ({info['text_size']} bytes)")
+    print("")
+
+    # Look for class/function/diagnostic names that sometimes survive stripping.
+    needles = [
+        "HTMLScriptElement",
+        "DirectiveList",
+        "AddDirective",
+        "Execute",
+        "ContentSecurityPolicy",
+        "Cobalt",
+        "yttv",
+        "youtube.com/tv",
+    ]
+    print("Interesting raw ASCII strings:")
+    print("-" * 72)
+    raw_hits = find_raw_ascii_occurrences(data, needles)
+    for needle in needles:
+        positions = raw_hits[needle]
+        if positions:
+            joined = ", ".join(hex(x) for x in positions[:8])
+            suffix = " ..." if len(positions) > 8 else ""
+            print(f"FOUND   {needle:28} file offsets: {joined}{suffix}")
+        else:
+            print(f"MISSING {needle}")
+
+    print("")
+    print("Old 4.54.01 patch-address context in this binary:")
+    print("-" * 72)
+    old_points = []
+    for p in PATCHES + COBALT_HOOKS:
+        old_points.append((p["name"], p["entry_va"]))
+    for p in COBALT_HDR_PATCHES:
+        old_points.append((p["name"], p["va"]))
+
+    text_end = info["text_va"] + info["text_size"]
+    for name, va in old_points:
+        if info["text_va"] <= va < text_end:
+            try:
+                dump_disasm_context(
+                    data,
+                    info,
+                    va,
+                    before=4,
+                    after=8,
+                    title=f"[{name}] old VA {hex(va)}",
+                )
+            except Exception as exc:
+                print(f"[{name}] unable to disassemble {hex(va)}: {exc}")
+        else:
+            print(f"[{name}] old VA {hex(va)} is outside current __text")
+
+    # Resolve useful imported stubs that still exist in this build.
+    desired = {
+        "insert": "__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEmPKcm",
+        "strstr": "_strstr",
+        "memcmp": "_memcmp",
+        "strlen": "_strlen",
+        "objc_getClass": "_objc_getClass",
+        "objc_msgSend": "_objc_msgSend",
+        "dlsym": "_dlsym",
+        "printf": "_printf",
+    }
+    target_vas = {}
+    for label, symbol in desired.items():
+        try:
+            target_vas[label] = resolve_stub_va(info, symbol)
+        except ValueError:
+            target_vas[label] = None
+
+    print("")
+    print("Scanning __text for direct BL references to useful imports...")
+    print("This can take a little while on a 200+ MB executable.")
+    print("-" * 72)
+    xrefs = scan_bl_xrefs(data, info, target_vas, max_hits_per_target=24)
+
+    for label in ("insert", "strstr", "memcmp", "strlen"):
+        target = target_vas.get(label)
+        if target is None:
+            print(f"{label}: import unavailable")
+            continue
+        calls = xrefs.get(label, [])
+        print(f"{label}: target {hex(target)}, captured {len(calls)} direct BL xrefs")
+        for va in calls:
+            print(f"  call @ {hex(va)}")
+
+    print("")
+    print("Disassembly around candidate std::string::insert call sites:")
+    print("-" * 72)
+    insert_calls = xrefs.get("insert", [])
+    if not insert_calls:
+        print("No direct BL xrefs to std::string::insert were captured.")
+    else:
+        for i, va in enumerate(insert_calls[:12], 1):
+            dump_disasm_context(
+                data,
+                info,
+                va,
+                before=10,
+                after=12,
+                title=f"[insert candidate {i}]",
+            )
+
+    print("Disassembly around candidate strstr call sites:")
+    print("-" * 72)
+    strstr_calls = xrefs.get("strstr", [])
+    if not strstr_calls:
+        print("No direct BL xrefs to strstr were captured.")
+    else:
+        for i, va in enumerate(strstr_calls[:12], 1):
+            dump_disasm_context(
+                data,
+                info,
+                va,
+                before=10,
+                after=12,
+                title=f"[strstr candidate {i}]",
+            )
+
+    print("=" * 72)
+    print("End μTube modern Cobalt candidate scan")
+    print("=" * 72)
+    print("")
+
+
 class Allocator:
     # Tiny bump allocator for header padding region.
     def __init__(self, start, end):
@@ -622,6 +818,8 @@ def patch_binary(data, enable_printf_logs=False):
     addrs |= resolved_stubs
 
     if missing_stubs:
+        diagnose_modern_cobalt(data, info)
+
         print("")
         print("=" * 72)
         print("YouTube/Cobalt compatibility problem")

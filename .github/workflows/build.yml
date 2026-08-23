@@ -1,0 +1,156 @@
+name: Build μTube
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: "URL to the decrypted YouTube tvOS IPA file"
+        required: true
+        type: string
+
+      enable_debug_logs:
+        description: "Enable μTube debug/printf logs"
+        required: true
+        default: false
+        type: boolean
+
+      output_name:
+        description: "Output IPA name"
+        required: true
+        default: "muTube"
+        type: string
+
+jobs:
+  build:
+    name: Build μTube IPA
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Download decrypted YouTube IPA
+        env:
+          IPA_URL: ${{ inputs.ipa_url }}
+        run: |
+          mkdir -p ipa
+
+          curl \
+            --location \
+            --fail \
+            --show-error \
+            --retry 3 \
+            --retry-delay 3 \
+            "$IPA_URL" \
+            --output ipa/input.ipa
+
+          if [ ! -s ipa/input.ipa ]; then
+            echo "ERROR: Downloaded IPA is empty."
+            exit 1
+          fi
+
+          echo "Downloaded IPA:"
+          ls -lh ipa/input.ipa
+
+      - name: Detect YouTube version
+        run: |
+          rm -rf /tmp/youtube
+          mkdir -p /tmp/youtube
+
+          unzip -q ipa/input.ipa -d /tmp/youtube
+
+          APP_PATH=$(find /tmp/youtube/Payload -maxdepth 1 -type d -name "*.app" | head -1)
+
+          if [ -z "$APP_PATH" ]; then
+            echo "ERROR: No .app bundle found."
+            exit 1
+          fi
+
+          INFO_PLIST="$APP_PATH/Info.plist"
+
+          if [ ! -f "$INFO_PLIST" ]; then
+            echo "ERROR: Info.plist not found."
+            exit 1
+          fi
+
+          YOUTUBE_VERSION=$(
+            /usr/libexec/PlistBuddy \
+            -c "Print :CFBundleShortVersionString" \
+            "$INFO_PLIST"
+          )
+
+          YOUTUBE_BUILD=$(
+            /usr/libexec/PlistBuddy \
+            -c "Print :CFBundleVersion" \
+            "$INFO_PLIST"
+          )
+
+          BUNDLE_ID=$(
+            /usr/libexec/PlistBuddy \
+            -c "Print :CFBundleIdentifier" \
+            "$INFO_PLIST"
+          )
+
+          echo "Detected YouTube version: $YOUTUBE_VERSION"
+          echo "Build: $YOUTUBE_BUILD"
+          echo "Bundle ID: $BUNDLE_ID"
+
+          echo "YOUTUBE_VERSION=$YOUTUBE_VERSION" >> "$GITHUB_ENV"
+          echo "YOUTUBE_BUILD=$YOUTUBE_BUILD" >> "$GITHUB_ENV"
+          echo "YOUTUBE_BUNDLE_ID=$BUNDLE_ID" >> "$GITHUB_ENV"
+
+      - name: Prepare IPA for μTube
+        run: |
+          cp ipa/input.ipa ipa/YouTube_4.54.01_decrypted.ipa
+
+      - name: Build μTube
+        env:
+          DEBUG_LOGS: ${{ inputs.enable_debug_logs }}
+        run: |
+          if [ "$DEBUG_LOGS" = "true" ]; then
+            make PRINTF_LOGS=1
+          else
+            make
+          fi
+
+      - name: Verify output
+        run: |
+          if [ ! -f mutube.ipa ]; then
+            echo "ERROR: mutube.ipa was not created."
+            exit 1
+          fi
+
+          unzip -t mutube.ipa >/dev/null
+
+      - name: Rename output IPA
+        env:
+          OUTPUT_NAME: ${{ inputs.output_name }}
+        run: |
+          SAFE_NAME=$(echo "$OUTPUT_NAME" | sed 's/[^A-Za-z0-9._-]/_/g')
+
+          FINAL_NAME="${SAFE_NAME}-YouTube-${YOUTUBE_VERSION}.ipa"
+
+          mv mutube.ipa "$FINAL_NAME"
+
+          echo "IPA_FILE=$FINAL_NAME" >> "$GITHUB_ENV"
+          echo "IPA_ARTIFACT=${SAFE_NAME}-YouTube-${YOUTUBE_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Build summary
+        run: |
+          echo "## μTube Build" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- YouTube version: **${YOUTUBE_VERSION}**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- YouTube build: **${YOUTUBE_BUILD}**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Bundle ID: \`${YOUTUBE_BUNDLE_ID}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Output: \`${IPA_FILE}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.IPA_ARTIFACT }}
+          path: ${{ env.IPA_FILE }}
+          if-no-files-found: error
+          retention-days: 7

@@ -17,7 +17,7 @@ import lief
 from capstone import Cs, CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN
 
 YTTV_NEEDLE = b"yttv"
-CSP_PREFIX = b"sponsorblock.inf.re sponsor.ajay.app dearrow-thumb.ajay.app cdn.jsdelivr.net "
+CSP_PREFIX = b"sponsorblock.inf.re sponsor.ajay.app dearrow-thumb.ajay.app cdn.jsdelivr.net api.github.com "
 LOG_HTML_ENTRY = b"MUTUBE_HTMLSCRIPT ra=%p\n"
 LOG_HTML_INJECT = b"MUTUBE_HTMLSCRIPT injected\n"
 LOG_CSP_ENTRY = b"MUTUBE_CSP ra=%p\n"
@@ -166,15 +166,45 @@ def restore_regs():
 
 
 def load_payload():
-    # Payload is source-of-truth JS kept in a dedicated file.
-    # Ignore full-line // comments so notes can live in inject.js without
-    # being embedded into the runtime payload.
-    text = Path(__file__).with_name("inject.js").read_text(encoding="ascii")
-    lines = [line for line in text.splitlines() if not line.lstrip().startswith("//")]
-    cleaned = "\n".join(lines).strip()
-    if not cleaned:
-        raise ValueError("inject.js is empty")
-    return cleaned.encode("ascii")
+    payload = Path(__file__).parent / "vendor/dist/userScript.js"
+    if not payload.is_file():
+        raise ValueError("Build userscript first: npm ci && npm run build in vendor/mods")
+    bootstrap = Path(__file__).with_name("bootstrap.js").read_bytes()
+    marker = b"/* MUTUBE_BUNDLE */"
+    if bootstrap.count(marker) != 1:
+        raise ValueError("bootstrap must contain exactly one bundle marker")
+    compat_marker = b"/* MUTUBE_COMPAT */"
+    if bootstrap.count(compat_marker) != 1:
+        raise ValueError("bootstrap must contain exactly one compatibility marker")
+    compat = Path(__file__).with_name("inject.js").read_bytes()
+    return bootstrap.replace(compat_marker, compat).replace(marker, payload.read_bytes())
+
+
+def add_payload_segment(data, payload):
+    # LIEF owns allocation/load-command updates. Never repurpose executable bytes.
+    binary = lief.MachO.parse(list(data)).at(0)
+    if binary.get_segment("__MUTUBE"):
+        raise ValueError("input is already patched")
+    original = [(section.name, section.virtual_address, bytes(section.content))
+                for section in binary.sections]
+    segment = lief.MachO.SegmentCommand("__MUTUBE", list(payload + b"\0"))
+    segment.init_protection = 1  # VM_PROT_READ; JavaScript is data, not native code
+    segment.max_protection = 1
+    binary.add(segment)
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "payload.macho"
+        binary.write(str(path))
+        result = bytearray(path.read_bytes())
+        rebuilt = lief.parse(str(path))
+    for name, address, content in original:
+        section = next((item for item in rebuilt.sections
+                        if item.name == name and item.virtual_address == address), None)
+        if section is None or bytes(section.content) != content:
+            raise ValueError(f"segment insertion changed existing section {name}")
+    added = rebuilt.get_segment("__MUTUBE")
+    if bytes(added.content)[:len(payload)] != payload:
+        raise ValueError("payload segment verification failed")
+    return result, added.virtual_address
 
 
 def parse_macho_info(data):
@@ -267,11 +297,12 @@ class Allocator:
         self.end = end
 
     def alloc(self, size, align=1):
-        self.cursor = (self.cursor + align - 1) & ~(align - 1)
-        off = self.cursor
-        self.cursor += size
-        if self.cursor > self.end:
-            raise ValueError("patch region out of space")
+        if size < 0 or align < 1 or align & (align - 1):
+            raise ValueError("invalid allocation size/alignment")
+        off = (self.cursor + align - 1) & ~(align - 1)
+        if off + size > self.end:
+            raise ValueError(f"patch region out of space: requested {size} bytes, {max(0, self.end - off)} available")
+        self.cursor = off + size
         return off
 
 
@@ -413,11 +444,13 @@ def build_stub(kind, stub_va, addrs, orig_ins, enable_printf_logs):
     return asm_lines(lines)
 
 
-def patch_binary(data, enable_printf_logs=False):
+def patch_binary(data, enable_printf_logs=False, payload_va=None):
     info = parse_macho_info(data)
     start, end = info["header_end"], info["text_off"]
     if start >= end:
         raise ValueError("no __TEXT padding available for stubs")
+    if any(data[start:end]):
+        raise ValueError("header padding contains nonzero data; refusing to overwrite it")
     alloc = Allocator(start, end)
 
     def put(blob, align=4):
@@ -426,10 +459,11 @@ def patch_binary(data, enable_printf_logs=False):
         return off
 
     js = load_payload()
+    if payload_va is None:
+        raise ValueError("payload must be allocated in a dedicated segment")
     # Embed runtime strings and payload in __TEXT header padding.
     offs = {
         "yttv": put(YTTV_NEEDLE + b"\0"),
-        "inject": put(js + b"\0"),
         "csp": put(CSP_PREFIX + b"\0"),
         "vp9_profile2_full": put(b"vp09.02\0"),
         "vp9_profile2_short": put(b"vp9.2\0"),
@@ -449,6 +483,7 @@ def patch_binary(data, enable_printf_logs=False):
 
     f2v = lambda off: info["text_seg_va"] + (off - info["text_seg_off"])
     addrs = {k: f2v(v) for k, v in offs.items()}
+    addrs["inject"] = payload_va
     addrs |= {
         "yttv_len": len(YTTV_NEEDLE),
         "inject_len": len(js),
@@ -520,10 +555,14 @@ def patch_binary(data, enable_printf_logs=False):
             }
         )
 
+    print(f"Header padding used: {alloc.cursor - start}/{end - start} bytes; payload: {len(js)} bytes in __MUTUBE")
     return out
 
 
 def patch_ipa(in_path, out_path, enable_printf_logs=False):
+    if (Path(in_path).resolve() == Path(out_path).resolve()
+            or (Path(out_path).exists() and Path(in_path).samefile(out_path))):
+        raise ValueError("input and output IPA must differ")
     # Replace only app binary inside IPA; preserve all other entries.
     with zipfile.ZipFile(in_path, "r") as zin:
         infos = zin.infolist()
@@ -532,7 +571,8 @@ def patch_ipa(in_path, out_path, enable_printf_logs=False):
             raise ValueError("YouTubeUnstable binary not found in IPA")
 
         binary = bytearray(zin.read(bin_info.filename))
-        meta = patch_binary(binary, enable_printf_logs=enable_printf_logs)
+        binary, payload_va = add_payload_segment(binary, load_payload())
+        meta = patch_binary(binary, enable_printf_logs=enable_printf_logs, payload_va=payload_va)
 
         with zipfile.ZipFile(out_path, "w") as zout:
             for info in infos:

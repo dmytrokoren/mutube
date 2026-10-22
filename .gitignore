@@ -1,7 +1,13 @@
+# Input and generated app archives are local only.
 ipa/
-bin/
-.make-tmp_*
 *.ipa
-.DS_Store
-scratch/
+# Installed dependencies and caches.
+node_modules/
 __pycache__/
+.DS_Store
+# Signing material and local credentials.
+*.p12
+*.p8
+*.mobileprovision
+.env
+.env.*

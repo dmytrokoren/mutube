@@ -6,8 +6,7 @@
 // HDR still does not work, but at least 4k works now.
 //
 (function () {
-if (document.mutube) return;
-document.mutube = true;
+// The patcher wraps the complete bundle in the one-time injection guard.
 
 // Cobalt goes straight from readyState "loading" to "complete" without ever firing
 // DOMContentLoaded. TizenTube is injected while still "loading", so its modules that
@@ -21,11 +20,6 @@ window.addEventListener('load', function () {
   document.dispatchEvent(new Event('DOMContentLoaded'));
   window.dispatchEvent(new Event('DOMContentLoaded'));
 });
-
-var script = document.createElement('script');
-script.src = "https://cdn.jsdelivr.net/npm/@foxreis/tizentube/dist/userScript.js?v=" + Date.now();
-script.async = true;
-document.head.appendChild(script);
 
 const originalIsTypeSupported = window.MediaSource.isTypeSupported.bind(window.MediaSource);
 

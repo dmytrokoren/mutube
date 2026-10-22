@@ -39,3 +39,19 @@ tests/node_modules/jsdom/package.json: tests/package.json tests/package-lock.jso
 .PHONY: refresh-cobalt-version
 refresh-cobalt-version:
 	python3 tools/refresh-cobalt-version.py
+
+# Simple entry points for the documented build workflows.
+.PHONY: build update-reference help
+build:
+	@$(MAKE) --no-print-directory clean
+	@$(MAKE) --no-print-directory all
+	@printf '\nReady: %s\nSign and install this IPA on your Apple TV.\n' "$(abspath $(OUTPUT_IPA))"
+
+update-reference:
+	@$(MAKE) --no-print-directory refresh-cobalt-version
+	@$(MAKE) --no-print-directory userscript
+	@$(MAKE) --no-print-directory build
+	@$(MAKE) --no-print-directory test
+
+help:
+	@printf '%s\n' 'make build              Build a fresh mutube.ipa' 'make update-reference   Refresh the Cobalt version label, rebuild and test' 'make test               Run checks after building' 'make clean              Remove the generated IPA'

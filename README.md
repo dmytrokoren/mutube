@@ -13,7 +13,7 @@ You need:
 
 - A Mac with **Xcode and the tvOS SDK** installed. Open Xcode once to finish its setup.
 - **uv**, **Node.js with npm**, and **Python 3.9 or newer**, available in Terminal.
-- Your own **decrypted YouTube 4.54.01 IPA**. Other versions are not supported by these native patches.
+- Your own **decrypted YouTube tvOS IPA**. Tested on 4.54.01
 - A way to sign and install an IPA on your Apple TV.
 
 The build resolves its Python dependencies with uv. JavaScript build and test
